@@ -14,7 +14,10 @@ import hmac
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import traceback
+from contextlib import asynccontextmanager
 from urllib.parse import quote
 
 import httpx
@@ -29,6 +32,11 @@ MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.85"))
 BUCKET = "private-full"
 MAX_OFFSET = 60  # alignment slack in fingerprint items (roughly 8 seconds)
 PAGE = 500
+SWEEP_SECONDS = int(os.getenv("SWEEP_SECONDS", "300"))  # catch-up scan interval
+MAX_FAILURES = 3  # give up on a broken file after this many tries (until restart)
+
+PROCESS_LOCK = threading.Lock()  # one file at a time (small free instance, and avoids races)
+failures: dict = {}
 
 # table -> (item_type, column holding the storage path)
 TABLES = {"tracks": ("track", "file_path"), "beats": ("beat", "full_path")}
@@ -36,7 +44,17 @@ TABLE_FOR_TYPE = {"track": "tracks", "beat": "beats"}
 
 HEADERS = {"apikey": SERVICE_KEY, "Authorization": f"Bearer {SERVICE_KEY}"}
 
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # Catch-up loop: on every start (e.g. waking from sleep) and every few minutes,
+    # fingerprint anything that was missed while the service was offline.
+    threading.Thread(target=sweep_loop, daemon=True).start()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # ---------- fingerprinting ----------
@@ -164,6 +182,11 @@ def save_result(payload: dict):
 # ---------- main pipeline ----------
 
 def process_record(table: str, record: dict, force: bool = False) -> str:
+    with PROCESS_LOCK:
+        return _process_record(table, record, force)
+
+
+def _process_record(table: str, record: dict, force: bool = False) -> str:
     item_type, path_col = TABLES[table]
     item_id = str(record["id"])
     storage_path = record.get(path_col)
@@ -199,6 +222,63 @@ def safe_process(table: str, record: dict, force: bool):
     except Exception:
         print(f"[{table} {record.get('id')}] FAILED")
         traceback.print_exc()
+
+
+# ---------- catch-up sweep ----------
+
+def fetch_paged(path: str, params: dict):
+    offset = 0
+    while True:
+        r = httpx.get(
+            f"{SUPABASE_URL}/rest/v1/{path}",
+            headers=HEADERS,
+            params={**params, "limit": PAGE, "offset": offset},
+            timeout=60,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        yield from rows
+        if len(rows) < PAGE:
+            return
+        offset += PAGE
+
+
+def sweep():
+    """Fingerprint every track/beat that has a file but no fingerprint yet.
+    Items waiting for review go first, so approvals are never stuck behind old uploads."""
+    done = {
+        (r["item_type"], r["item_id"])
+        for r in fetch_paged("audio_fingerprints", {"select": "item_type,item_id", "order": "item_type,item_id"})
+    }
+    todo = []
+    for table, (item_type, path_col) in TABLES.items():
+        for rec in fetch_paged(table, {
+            "select": f"id,title,status,{path_col}",
+            path_col: "not.is.null",
+            "order": "id",
+        }):
+            key = (item_type, str(rec["id"]))
+            if key in done or failures.get(key, 0) >= MAX_FAILURES:
+                continue
+            todo.append((0 if rec.get("status") == "pending_review" else 1, table, key, rec))
+    todo.sort(key=lambda t: t[0])
+
+    for _, table, key, rec in todo:
+        try:
+            print(f"[sweep {table} {rec['id']}] {process_record(table, rec)}")
+        except Exception:
+            failures[key] = failures.get(key, 0) + 1
+            print(f"[sweep {table} {rec['id']}] FAILED ({failures[key]}/{MAX_FAILURES})")
+            traceback.print_exc()
+
+
+def sweep_loop():
+    while True:
+        try:
+            sweep()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(SWEEP_SECONDS)
 
 
 # ---------- HTTP ----------
