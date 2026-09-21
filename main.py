@@ -29,7 +29,7 @@ SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.85"))
 
-BUCKET = "private-full"
+BUCKETS = ["private-full", "public-previews"]  # paid uploads, free uploads
 MAX_OFFSET = 60  # alignment slack in fingerprint items (roughly 8 seconds)
 PAGE = 500
 SWEEP_SECONDS = int(os.getenv("SWEEP_SECONDS", "300"))  # catch-up scan interval
@@ -103,26 +103,25 @@ def check(r):
 
 
 def download_to_temp(storage_path: str) -> str:
+    """Free uploads live in public-previews, paid ones in private-full: try both."""
     ext = os.path.splitext(storage_path)[1] or ".mp3"
     quoted = quote(storage_path, safe="/")
-    routes = [
-        ("authenticated", f"{SUPABASE_URL}/storage/v1/object/authenticated/{BUCKET}/{quoted}"),
-        ("plain", f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{quoted}"),
-    ]
     fd, tmp = tempfile.mkstemp(suffix=ext)
     os.close(fd)
     errors = []
-    for name, url in routes:
-        with httpx.stream("GET", url, headers=HEADERS, timeout=120) as r:
-            if r.status_code == 200:
-                with open(tmp, "wb") as f:
-                    for chunk in r.iter_bytes():
-                        f.write(chunk)
-                return tmp
-            r.read()
-            errors.append(f"{name} route: {r.status_code} {r.text[:200]}")
+    for bucket in BUCKETS:
+        for route in ("object/authenticated", "object"):
+            url = f"{SUPABASE_URL}/storage/v1/{route}/{bucket}/{quoted}"
+            with httpx.stream("GET", url, headers=HEADERS, timeout=120) as r:
+                if r.status_code == 200:
+                    with open(tmp, "wb") as f:
+                        for chunk in r.iter_bytes():
+                            f.write(chunk)
+                    return tmp
+                r.read()
+                errors.append(f"{bucket}/{route}: {r.status_code} {r.text[:120]}")
     os.remove(tmp)
-    raise RuntimeError("storage download failed (" + BUCKET + "/" + storage_path + "): " + " | ".join(errors))
+    raise RuntimeError(f"storage download failed ({storage_path}): " + " | ".join(errors))
 
 
 def already_done(item_type: str, item_id: str) -> bool:
