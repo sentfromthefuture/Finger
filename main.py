@@ -8,7 +8,9 @@ Environment variables:
   SUPABASE_URL                https://<project>.supabase.co
   SUPABASE_SERVICE_ROLE_KEY   service-role key (server only, never in the browser)
   WEBHOOK_SECRET              the webhook sends it as "Authorization: Bearer <secret>"
-  MATCH_THRESHOLD             optional, default 0.85 (tune on your own tracks)
+  MIN_OVERLAP                 optional, default 0.20: flag when this much of the shorter track matches
+  WINDOW_MATCH                optional, default 0.72: how closely a 10-second window must match (0..1)
+  FP_SECONDS                  optional, default 300: how many seconds of each track to fingerprint
 """
 import hmac
 import os
@@ -22,15 +24,19 @@ from urllib.parse import quote
 
 import httpx
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
-MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.85"))
+MIN_OVERLAP = float(os.getenv("MIN_OVERLAP", "0.20"))
+WINDOW_MATCH = float(os.getenv("WINDOW_MATCH", "0.72"))
+FP_SECONDS = int(os.getenv("FP_SECONDS", "300"))
 
 BUCKETS = ["private-full", "public-previews"]  # paid uploads, free uploads
-MAX_OFFSET = 60  # alignment slack in fingerprint items (roughly 8 seconds)
+WINDOW = 80  # fingerprint items per comparison window (about 10 seconds)
+STEP = 40    # window spacing (about 5 seconds)
 PAGE = 500
 SWEEP_SECONDS = int(os.getenv("SWEEP_SECONDS", "300"))  # catch-up scan interval
 MAX_FAILURES = 3  # give up on a broken file after this many tries (until restart)
@@ -60,10 +66,10 @@ app = FastAPI(lifespan=lifespan)
 # ---------- fingerprinting ----------
 
 def fingerprint_file(path: str) -> list[int]:
-    """Run fpcalc and return the raw fingerprint as signed 32-bit ints (first ~2 minutes)."""
+    """Run fpcalc and return the raw fingerprint as signed 32-bit ints (first FP_SECONDS seconds)."""
     out = subprocess.run(
-        ["fpcalc", "-raw", "-signed", path],
-        capture_output=True, text=True, timeout=180, check=True,
+        ["fpcalc", "-raw", "-signed", "-length", str(FP_SECONDS), path],
+        capture_output=True, text=True, timeout=600, check=True,
     ).stdout
     for line in out.splitlines():
         if line.startswith("FINGERPRINT="):
@@ -77,21 +83,29 @@ def to_array(fp: list[int]) -> np.ndarray:
     return np.array(fp, dtype=np.int32).view(np.uint32)
 
 
-def similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Best bit-level similarity (0..1) over a range of alignments."""
-    best = 0.0
-    min_overlap = max(1, int(0.5 * min(len(a), len(b))))
-    for off in range(-MAX_OFFSET, MAX_OFFSET + 1):
-        if off >= 0:
-            x, y = a[off:], b
-        else:
-            x, y = a, b[-off:]
-        n = min(len(x), len(y))
-        if n < min_overlap:
+def overlap(a: np.ndarray, b: np.ndarray) -> float:
+    """Fraction (0..1) of the shorter track that also appears somewhere in the longer one.
+
+    Slides ~10-second windows of the shorter track across the longer one and counts
+    the windows that find a close match, so reused sections are caught even when the
+    rest of the song is different. Silent/near-constant windows are ignored.
+    """
+    if len(a) > len(b):
+        a, b = b, a
+    w = min(WINDOW, len(a))
+    if w < 8:
+        return 0.0
+    views = sliding_window_view(b, w)  # every possible alignment in the longer track
+    matched = total = 0
+    for start in range(0, len(a) - w + 1, STEP):
+        win = a[start:start + w]
+        if len(np.unique(win)) < w // 4:  # silence or a flat tone: skip
             continue
-        bits = int(np.bitwise_count(x[:n] ^ y[:n]).sum())
-        best = max(best, 1.0 - bits / (32.0 * n))
-    return best
+        total += 1
+        bits = np.bitwise_count(views ^ win).sum(axis=1)
+        if 1.0 - int(bits.min()) / (32.0 * w) >= WINDOW_MATCH:
+            matched += 1
+    return matched / total if total else 0.0
 
 
 # ---------- Supabase helpers ----------
@@ -157,7 +171,7 @@ def find_best_match(item_type: str, item_id: str, fp: list[int]):
         for row in rows:
             if row["item_type"] == item_type and row["item_id"] == item_id:
                 continue
-            score = similarity(mine, to_array(row["fingerprint"]))
+            score = overlap(mine, to_array(row["fingerprint"]))
             if score > best_score:
                 best_score, best_row = score, row
         if len(rows) < PAGE:
@@ -213,7 +227,7 @@ def _process_record(table: str, record: dict, force: bool = False) -> str:
         os.remove(tmp)
 
     score, row = find_best_match(item_type, item_id, fp)
-    is_match = row is not None and score >= MATCH_THRESHOLD
+    is_match = row is not None and score >= MIN_OVERLAP
 
     save_result({
         "item_type": item_type,
