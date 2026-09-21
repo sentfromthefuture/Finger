@@ -96,21 +96,33 @@ def similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 # ---------- Supabase helpers ----------
 
+def check(r):
+    """Like raise_for_status, but includes the server's message so the logs explain the failure."""
+    if r.status_code >= 400:
+        raise RuntimeError(f"{r.request.method} {r.request.url.path} -> {r.status_code}: {r.text[:300]}")
+
+
 def download_to_temp(storage_path: str) -> str:
     ext = os.path.splitext(storage_path)[1] or ".mp3"
-    url = f"{SUPABASE_URL}/storage/v1/object/authenticated/{BUCKET}/{quote(storage_path, safe='/')}"
+    quoted = quote(storage_path, safe="/")
+    routes = [
+        ("authenticated", f"{SUPABASE_URL}/storage/v1/object/authenticated/{BUCKET}/{quoted}"),
+        ("plain", f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{quoted}"),
+    ]
     fd, tmp = tempfile.mkstemp(suffix=ext)
     os.close(fd)
-    try:
+    errors = []
+    for name, url in routes:
         with httpx.stream("GET", url, headers=HEADERS, timeout=120) as r:
-            r.raise_for_status()
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_bytes():
-                    f.write(chunk)
-    except Exception:
-        os.remove(tmp)
-        raise
-    return tmp
+            if r.status_code == 200:
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_bytes():
+                        f.write(chunk)
+                return tmp
+            r.read()
+            errors.append(f"{name} route: {r.status_code} {r.text[:200]}")
+    os.remove(tmp)
+    raise RuntimeError("storage download failed (" + BUCKET + "/" + storage_path + "): " + " | ".join(errors))
 
 
 def already_done(item_type: str, item_id: str) -> bool:
@@ -120,7 +132,7 @@ def already_done(item_type: str, item_id: str) -> bool:
         params={"select": "item_id", "item_type": f"eq.{item_type}", "item_id": f"eq.{item_id}"},
         timeout=30,
     )
-    r.raise_for_status()
+    check(r)
     return len(r.json()) > 0
 
 
@@ -141,7 +153,7 @@ def find_best_match(item_type: str, item_id: str, fp: list[int]):
             },
             timeout=60,
         )
-        r.raise_for_status()
+        check(r)
         rows = r.json()
         for row in rows:
             if row["item_type"] == item_type and row["item_id"] == item_id:
@@ -162,7 +174,7 @@ def get_title(item_type: str, item_id: str):
         params={"select": "title", "id": f"eq.{item_id}"},
         timeout=30,
     )
-    r.raise_for_status()
+    check(r)
     rows = r.json()
     return rows[0]["title"] if rows else None
 
@@ -176,7 +188,7 @@ def save_result(payload: dict):
         json=payload,
         timeout=60,
     )
-    r.raise_for_status()
+    check(r)
 
 
 # ---------- main pipeline ----------
@@ -235,7 +247,7 @@ def fetch_paged(path: str, params: dict):
             params={**params, "limit": PAGE, "offset": offset},
             timeout=60,
         )
-        r.raise_for_status()
+        check(r)
         rows = r.json()
         yield from rows
         if len(rows) < PAGE:
