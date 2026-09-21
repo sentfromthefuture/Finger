@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+httpx
+numpy>=2.0
